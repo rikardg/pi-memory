@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Exit summaries now pass the session id to the completion call. Providers route
+  on it: OpenCode Go rejects any request without one (`400 MissingSessionID`,
+  the `x-opencode-session` header pi-ai derives from the session id), so every
+  OpenCode Go model silently lost its exit summaries.
+- Exit summaries that fail are recorded instead of dropped. A missing key, a
+  provider error, the shutdown timeout, or an unexpected exception now appends
+  a line to `memory/.exit-summary.log` and raises a UI warning when a UI is
+  available. Previously a failed summary left nothing behind, which hid the
+  OpenCode Go breakage and left no way to tell a silent failure from a session
+  with nothing to say.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

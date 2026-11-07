@@ -18,11 +18,14 @@ import {
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
+	_resetExitSummaryCompleteForTest,
 	_resetMemorySnapshot,
 	_resetQmdJsResolutionForTest,
 	_setBaseDir,
 	_setExecFileForTest,
+	_setExitSummaryCompleteForTest,
 	_setQmdAvailable,
+	buildExitSummaryRequestOptions,
 	buildMemoryContext,
 	buildQmdEnv,
 	buildQmdSpawn,
@@ -30,6 +33,7 @@ import {
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
+	exitSummaryLogPath,
 	forgetBlocks,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
@@ -1828,6 +1832,191 @@ describe("lifecycle hooks", () => {
 		test("getExitSummaryReasoningEffort treats empty string as default", () => {
 			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "   ";
 			expect(getExitSummaryReasoningEffort()).toBe("low");
+		});
+	});
+
+	// -- exit summary request routing and failure reporting --
+
+	describe("exit summary provider routing", () => {
+		const sessionId = "01a1b74e-9804-776c-9fcc-ee4f4f7ba8c0";
+
+		const fourMessageBranch = () => [
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Please remember we chose dark mode." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Also migrate the config to match." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+					timestamp: Date.now(),
+				},
+			},
+		];
+
+		function summaryCtx() {
+			return createShutdownCtx({
+				sessionId,
+				branch: fourMessageBranch(),
+				model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+				modelRegistry: { getApiKey: mock(async () => "key") },
+			});
+		}
+
+		afterEach(() => {
+			_resetExitSummaryCompleteForTest();
+		});
+
+		test("buildExitSummaryRequestOptions carries the session id", () => {
+			// Providers shape the outgoing request from these options. OpenCode Go
+			// rejects any request without a session id, because pi-ai derives its
+			// required x-opencode-session routing header from it.
+			const options = buildExitSummaryRequestOptions("key-123", summaryCtx());
+
+			expect(options.apiKey).toBe("key-123");
+			expect(options.sessionId).toBe(sessionId);
+		});
+
+		test("session_shutdown sends the session id with the summary request", async () => {
+			const seen: any[] = [];
+			_setExitSummaryCompleteForTest((async (_model: unknown, _context: unknown, options: unknown) => {
+				seen.push(options);
+				return { content: [{ type: "text", text: "### Decisions\n- keep it simple" }] };
+			}) as any);
+			const prevQmdUpdate = process.env.PI_MEMORY_QMD_UPDATE;
+			process.env.PI_MEMORY_QMD_UPDATE = "off";
+
+			try {
+				await hooks.session_shutdown({ reason: "quit" }, summaryCtx());
+			} finally {
+				if (prevQmdUpdate === undefined) delete process.env.PI_MEMORY_QMD_UPDATE;
+				else process.env.PI_MEMORY_QMD_UPDATE = prevQmdUpdate;
+			}
+
+			expect(seen).toHaveLength(1);
+			expect(seen[0].sessionId).toBe(sessionId);
+			expect(fs.readFileSync(dailyPath(todayStr()), "utf-8")).toContain("Session Summary (auto, exit: session-end)");
+		});
+	});
+
+	describe("exit summary failure reporting", () => {
+		const fourMessageBranch = () => [
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Please remember we chose SQLite." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "Noted." }], timestamp: Date.now() },
+			},
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Also migrate the config." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done — tests pass." }],
+					timestamp: Date.now(),
+				},
+			},
+		];
+
+		function summaryCtx(hasUI = false) {
+			return {
+				...createShutdownCtx({
+					branch: fourMessageBranch(),
+					model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+					modelRegistry: { getApiKey: mock(async () => "key") },
+				}),
+				hasUI,
+			};
+		}
+
+		let savedTimeout: string | undefined;
+		beforeEach(() => {
+			savedTimeout = process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
+		});
+		afterEach(() => {
+			_resetExitSummaryCompleteForTest();
+			if (savedTimeout === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
+			else process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = savedTimeout;
+		});
+
+		test("records a failed exit summary instead of dropping it silently", async () => {
+			_setExitSummaryCompleteForTest((async () => {
+				throw new Error("400 MissingSessionID");
+			}) as any);
+
+			await hooks.session_shutdown({ reason: "quit" }, summaryCtx());
+
+			const log = fs.readFileSync(exitSummaryLogPath(), "utf-8");
+			expect(log).toContain("400 MissingSessionID");
+			expect(log).toContain("[abcdef12]");
+			expect(log).toContain("session-end");
+		});
+
+		test("records a timed-out exit summary", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "25";
+			_setExitSummaryCompleteForTest((() => new Promise(() => {})) as any);
+
+			await hooks.session_shutdown({ reason: "quit" }, summaryCtx());
+
+			expect(fs.readFileSync(exitSummaryLogPath(), "utf-8")).toContain("timed out after 25ms");
+		});
+
+		test("warns in the UI as well when a summary fails", async () => {
+			_setExitSummaryCompleteForTest((async () => {
+				throw new Error("boom");
+			}) as any);
+			const ctx = summaryCtx(true);
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(ctx.ui.notify).toHaveBeenCalled();
+			expect(String((ctx.ui.notify as any).mock.calls[0][0])).toContain("boom");
+		});
+
+		test("records nothing when the session is too short to summarize", async () => {
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch().slice(0, 2),
+				model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+				modelRegistry: { getApiKey: mock(async () => "key") },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(fs.existsSync(exitSummaryLogPath())).toBe(false);
 		});
 	});
 

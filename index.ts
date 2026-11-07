@@ -416,6 +416,43 @@ function resolveExitSummaryModel(ctx: ExtensionContext): ExtensionContext["model
 	return ctx.model;
 }
 
+/**
+ * Diagnostics log for exit summaries that never reached the daily log. A
+ * `.log` file, so it is neither memory content nor part of the qmd collection.
+ */
+export function exitSummaryLogPath(): string {
+	return path.join(MEMORY_DIR, ".exit-summary.log");
+}
+
+/**
+ * Request options for the exit-summary completion call. Providers shape the
+ * outgoing request from these: OpenCode Go refuses a request without a session
+ * id, because pi-ai derives its required `x-opencode-session` header from it.
+ */
+export function buildExitSummaryRequestOptions(apiKey: string, ctx: ExtensionContext) {
+	return {
+		apiKey,
+		reasoningEffort: getExitSummaryReasoningEffort(),
+		sessionId: ctx.sessionManager.getSessionId(),
+	};
+}
+
+/**
+ * The exit-summary completion call, indirected so tests can observe the request
+ * options without a provider. Always the real `complete` outside tests.
+ */
+let exitSummaryComplete: typeof complete = complete;
+
+/** Override the exit-summary completion call (for testing). */
+export function _setExitSummaryCompleteForTest(fn: typeof complete) {
+	exitSummaryComplete = fn;
+}
+
+/** Restore the real completion call (for testing). */
+export function _resetExitSummaryCompleteForTest() {
+	exitSummaryComplete = complete;
+}
+
 async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
 	const branch = getSessionBranch(ctx);
 	if (!branch) {
@@ -464,10 +501,10 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 	];
 
 	try {
-		const response = await complete(
+		const response = await exitSummaryComplete(
 			model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
+			buildExitSummaryRequestOptions(apiKey, ctx),
 		);
 
 		const summaryText = response.content
@@ -483,6 +520,47 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		return { summary: summaryText, hasMessages: true };
 	} catch (err) {
 		return { summary: null, error: err instanceof Error ? err.message : String(err), hasMessages: true };
+	}
+}
+
+/**
+ * Record an exit summary that never reached the daily log. Failures used to be
+ * dropped silently, which hid a provider that rejected every summary request.
+ * Kept out of the daily log: that file is memory content, re-injected at every
+ * session start, and a `.log` file is not part of the qmd collection.
+ */
+function recordExitSummaryFailure(reason: ExitSummaryReason, error: string, sessionId: string): void {
+	const detail = error.replace(/\s+/g, " ").trim();
+	const line = `${nowTimestamp()} [${shortSessionId(sessionId)}] ${formatExitSummaryReason(reason)}: ${detail}\n`;
+	try {
+		ensureDirs();
+		fs.appendFileSync(exitSummaryLogPath(), line, "utf-8");
+	} catch {
+		/* Diagnostics must never break quitting. */
+	}
+}
+
+function reportExitSummaryFailure(
+	ctx: ExtensionContext,
+	reason: ExitSummaryReason,
+	sessionId: string,
+	error: string,
+): void {
+	recordExitSummaryFailure(reason, error, sessionId);
+	if (!ctx.hasUI) return;
+	try {
+		ctx.ui.notify(`pi-memory: exit summary not written — ${error} (see ${exitSummaryLogPath()})`, "warning");
+	} catch {
+		/* UI may already be tearing down during shutdown */
+	}
+}
+
+/** Session id for the diagnostics log; shutdown must survive a bare context. */
+function sessionIdForLog(ctx: ExtensionContext): string {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return "unknown";
 	}
 }
 
@@ -1535,14 +1613,30 @@ export default function (pi: ExtensionAPI) {
 				const expired = new Promise<null>((resolve) => {
 					summaryTimer = setTimeout(() => resolve(null), getExitSummaryTimeoutMs());
 				});
-				const result = await Promise.race([summaryWork, expired]);
+				const result = await Promise.race([summaryWork, expired]).catch(
+					(err): ExitSummaryResult => ({
+						summary: null,
+						error: err instanceof Error ? err.message : String(err),
+						hasMessages: true,
+					}),
+				);
 				// Only persist real summaries. The old fallback appended an
 				// all-"None." boilerplate block on every failed summarization
 				// (no API key, empty response, …), polluting the daily log —
 				// which is then re-injected into context every session start.
 				// Successful-but-empty summaries (every section "None.") are
-				// filtered out for the same reason.
-				if (result?.hasMessages && result.summary && !isExitSummaryEmpty(result.summary)) {
+				// filtered out for the same reason. Failures go to the
+				// diagnostics log instead of vanishing.
+				if (!result) {
+					reportExitSummaryFailure(
+						ctx,
+						reason,
+						sessionIdForLog(ctx),
+						`timed out after ${getExitSummaryTimeoutMs()}ms`,
+					);
+				} else if (result.error) {
+					reportExitSummaryFailure(ctx, reason, sessionIdForLog(ctx), result.error);
+				} else if (result.hasMessages && result.summary && !isExitSummaryEmpty(result.summary)) {
 					const summary = result.summary;
 					const sid = shortSessionId(ctx.sessionManager.getSessionId());
 					const ts = nowTimestamp();
