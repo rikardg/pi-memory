@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The exit-summary timeout now defaults to 60 s instead of 10 s
+  (`PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS`). A long session sends up to 80k
+  characters of transcript, and that call routinely takes longer than ten
+  seconds on a real provider; when it did, the summary was lost and quitting
+  looked hung. Observed on a 1.7 MB session: two consecutive exits logged
+  `timed out after 10000ms` and wrote nothing.
+
 ### Fixed
 
 - Exit summaries now pass the session id to the completion call. Providers route

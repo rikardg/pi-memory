@@ -1768,13 +1768,13 @@ describe("lifecycle hooks", () => {
 
 		test("getExitSummaryTimeoutMs parses env with fallback to default", () => {
 			delete process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "250";
 			expect(getExitSummaryTimeoutMs()).toBe(250);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "not-a-number";
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "-5";
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 		});
 
 		test("session_shutdown stays responsive when summary generation hangs", async () => {

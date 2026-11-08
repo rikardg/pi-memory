@@ -602,13 +602,18 @@ export function isExitSummaryEmpty(summary: string): boolean {
 	return contentLines.every((line) => /^none\.?$/i.test(line.replace(/^[-*+]\s*/, "")));
 }
 
-const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 10_000;
+const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 60_000;
 
 /**
  * Self-imposed timeout for the exit-summary work on session_shutdown. Pi core
  * awaits shutdown handlers with no timeout, and generateExitSummary() is only
  * bounded by the provider's own timeout — a hanging provider would otherwise
  * block quitting indefinitely. Override with PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS.
+ *
+ * The default is a minute, not the ten seconds it used to be: a long session
+ * sends up to 80k characters of transcript, and on a real provider that call
+ * routinely takes longer than ten seconds. When it does, the summary is lost
+ * and the user sees a blank screen — the failure mode behind #55.
  */
 export function getExitSummaryTimeoutMs(): number {
 	const configured = Number(process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS);
